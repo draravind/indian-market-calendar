@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "indian-market-calendar"
+version = "0.1.0"
+description = "IST time helpers, NSE holidays, and an NSE trading calendar — standalone and dependency-injected."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Aravind V" }]
+dependencies = [
+    "nsepython",
+    "pandas",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["indian_market_calendar"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
