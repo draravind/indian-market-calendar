@@ -6,7 +6,9 @@ optional logger) once at startup via ``configure()``.
 
 Public API (see ``__all__``):
   Time      — IST, MARKET_OPEN, MARKET_CLOSE, now, today, is_after_market_close
-  Holidays  — load_holidays (NSE fetch + atomic pickle cache, memoized per IST date)
+  Holidays  — load_holidays (saved list only, never the network),
+              refresh_holidays (NSE fetch, merged by year, saved atomically),
+              holiday_cache_path
   Calendar  — is_trading_day, compute_last_trading_day, next_trading_day
   Market    — Market, is_market_open, next_fire_at, is_in_session_window,
               next_session_window_open, SESSION_WINDOW_* buffers
@@ -36,6 +38,8 @@ __all__ = [
     "today",
     "is_after_market_close",
     "load_holidays",
+    "refresh_holidays",
+    "holiday_cache_path",
     "is_trading_day",
     "compute_last_trading_day",
     "next_trading_day",
@@ -83,10 +87,14 @@ def configure(cache_path, logger=None) -> None:
     ``logger`` must be ``logging.Logger``-compatible — the package calls only
     ``logger.warning(msg)`` / ``logger.error(msg)``. When ``None`` the package
     falls back to ``logging.getLogger("indian_market_calendar")``.
+    The remembered holiday list is dropped: it came from the previous file.
     """
-    global _cache_path, _logger
+    global _cache_path, _logger, _cached_holidays, _load_failed_on
     _cache_path = Path(cache_path)
     _logger = logger if logger is not None else logging.getLogger("indian_market_calendar")
+    with _cache_lock:
+        _cached_holidays = None
+        _load_failed_on = None
 
 
 def _get_logger() -> logging.Logger:
@@ -118,50 +126,86 @@ def _atomic_write_bytes(data: bytes, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Holidays (NSE fetch + atomic pickle cache, memoized per IST date)
+# Holidays (saved pickle read by questions; NSE fetched only by refresh)
 # --------------------------------------------------------------------------- #
 _cache_lock = threading.Lock()
 _cached_holidays: list[date] | None = None
-_cached_date: date | None = None
+_load_failed_on: date | None = None  # IST date of the last failed file read
 
 
-def _fetch_holidays() -> list[date]:
-    """Fetch from NSE, persist to pickle, fall back to pickle on failure."""
-    try:
-        holidays = nsepython.holiday_master()
-        holidays = pd.DataFrame(holidays["CM"])["tradingDate"]
-        if not holidays.empty:
-            _atomic_write_bytes(pickle.dumps(holidays), _cache_path)
-        return pd.to_datetime(holidays).dt.date.tolist()
-    except Exception as e:
-        _get_logger().warning(f"NSE holiday API failed: {e}")
-        try:
-            with open(_cache_path, "rb") as f:
-                holidays = pickle.load(f)
-            return pd.to_datetime(holidays).dt.date.tolist()
-        except Exception as cache_err:
-            _get_logger().error(f"holiday cache load failed: {cache_err}")
-            return []
-
-
-def load_holidays() -> list[date]:
-    """Return NSE holiday list, cached in-process per IST date."""
+def holiday_cache_path() -> Path:
+    """The configured holiday-cache file."""
     if _cache_path is None:
         raise RuntimeError(
             "indian_market_calendar is not configured: call "
-            "configure(cache_path=...) before load_holidays()."
+            "configure(cache_path=...) first."
         )
-    global _cached_holidays, _cached_date
-    anchor = today()
+    return _cache_path
+
+
+def _read_cache_file(path: Path) -> list[date]:
+    with open(path, "rb") as f:
+        holidays = pickle.load(f)
+    return pd.to_datetime(holidays).dt.date.tolist()
+
+
+def load_holidays() -> list[date]:
+    """Return the saved NSE holiday list; never touches the network.
+
+    Read from the cache file once and kept in memory. With no readable file,
+    returns ``[]`` and logs one error per IST date, retrying the file next date.
+    """
+    global _cached_holidays, _load_failed_on
+    path = holiday_cache_path()
     cached = _cached_holidays
-    if cached is not None and _cached_date == anchor:
+    if cached is not None:
         return cached
     with _cache_lock:
-        if _cached_holidays is not None and _cached_date == anchor:
+        if _cached_holidays is not None:
             return _cached_holidays
-        _cached_holidays = _fetch_holidays()
-        _cached_date = anchor
+        anchor = today()
+        if _load_failed_on == anchor:
+            return []
+        try:
+            _cached_holidays = _read_cache_file(path)
+        except Exception as cache_err:
+            _get_logger().error(f"holiday cache load failed: {cache_err}")
+            _load_failed_on = anchor
+            return []
         return _cached_holidays
+
+
+def refresh_holidays() -> bool:
+    """Fetch NSE's holiday list, merge it by year, save it and use it.
+
+    The answer's years replace their own dates; kept dates of other years stay.
+    On a failed or empty answer the kept list stays and ``False`` is returned.
+    No lock is held while NSE is called.
+    """
+    global _cached_holidays
+    path = holiday_cache_path()
+    try:
+        answer = nsepython.holiday_master()
+        fetched = pd.to_datetime(pd.DataFrame(answer["CM"])["tradingDate"]).dt.date.tolist()
+        if not fetched:
+            raise ValueError("empty holiday list")
+    except Exception as e:
+        _get_logger().warning(f"NSE holiday API failed: {e}")
+        load_holidays()
+        return False
+    kept = _cached_holidays
+    if kept is None:
+        try:
+            kept = _read_cache_file(path)
+        except Exception:
+            kept = []
+    years = {d.year for d in fetched}
+    merged = sorted({d for d in kept if d.year not in years} | set(fetched))
+    saved = pd.Series([d.strftime("%d-%b-%Y") for d in merged])
+    _atomic_write_bytes(pickle.dumps(saved), path)
+    with _cache_lock:
+        _cached_holidays = merged
+    return True
 
 
 # --------------------------------------------------------------------------- #

@@ -1,43 +1,180 @@
-"""Tests for load_holidays caching and configure() guard."""
+"""Tests for load_holidays (saved list only), refresh_holidays and configure()."""
 import datetime as dt
+import logging
+import pickle
+import threading
+import time
 
+import nsepython
+import pandas as pd
 import pytest
 
 import indian_market_calendar as imc
 from indian_market_calendar import load_holidays
 
+LIST_2026 = [dt.date(2026, 1, 26), dt.date(2026, 10, 20), dt.date(2026, 12, 25)]
 
-class TestCaching:
-    def test_one_fetch_per_ist_date(self, monkeypatch):
-        calls = {"n": 0}
 
-        def fake_fetch():
-            calls["n"] += 1
-            return [dt.date(2025, 3, 14)]
+def _save(path, days):
+    """Write ``days`` in NSE's saved shape: a Series of ``%d-%b-%Y`` strings."""
+    path.write_bytes(pickle.dumps(pd.Series([d.strftime("%d-%b-%Y") for d in days])))
 
-        monkeypatch.setattr(imc, "_fetch_holidays", fake_fetch)
-        monkeypatch.setattr(imc, "today", lambda: dt.date(2025, 3, 12))
 
-        first = load_holidays()
-        second = load_holidays()
-        third = load_holidays()
-        assert first == second == third == [dt.date(2025, 3, 14)]
-        assert calls["n"] == 1  # memoized within the same IST date
+def _saved(path):
+    return pd.to_datetime(pickle.loads(path.read_bytes())).dt.date.tolist()
 
-    def test_refetch_on_new_ist_date(self, monkeypatch):
-        calls = {"n": 0}
 
-        def fake_fetch():
-            calls["n"] += 1
-            return [dt.date(2025, 3, 14)]
+def _answer(*trading_dates):
+    """NSE's ``holiday_master()`` answer for these ``%d-%b-%Y`` dates."""
+    return {"CM": [{"tradingDate": d} for d in trading_dates]}
 
-        monkeypatch.setattr(imc, "_fetch_holidays", fake_fetch)
 
-        monkeypatch.setattr(imc, "today", lambda: dt.date(2025, 3, 12))
-        load_holidays()
-        monkeypatch.setattr(imc, "today", lambda: dt.date(2025, 3, 13))
-        load_holidays()
-        assert calls["n"] == 2  # one fetch per distinct IST date
+@pytest.fixture
+def cache_file():
+    return imc.holiday_cache_path()
+
+
+@pytest.fixture
+def nse_calls(monkeypatch):
+    """Record every NSE call; tests set ``answer`` (a dict, or an exception to raise)."""
+    record = {"calls": 0, "answer": RuntimeError("NSE unreachable")}
+
+    def fake_holiday_master():
+        record["calls"] += 1
+        if isinstance(record["answer"], BaseException):
+            raise record["answer"]
+        return record["answer"]
+
+    monkeypatch.setattr(nsepython, "holiday_master", fake_holiday_master)
+    return record
+
+
+class TestLoadNeverFetches:
+    def test_load_never_calls_nse(self, monkeypatch, cache_file, nse_calls):
+        _save(cache_file, LIST_2026)
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 10, 19))
+        assert load_holidays() == LIST_2026
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 10, 20))
+        assert load_holidays() == LIST_2026
+        assert nse_calls["calls"] == 0
+
+    def test_no_file_answers_empty_without_nse(self, nse_calls):
+        assert load_holidays() == []
+        assert nse_calls["calls"] == 0
+
+    def test_no_file_logs_one_error_per_date(self, monkeypatch, caplog):
+        caplog.set_level(logging.ERROR, logger="indian_market_calendar")
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 10, 19))
+        assert load_holidays() == []
+        assert load_holidays() == []
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 10, 20))
+        assert load_holidays() == []
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 2
+        assert all(m.startswith("holiday cache load failed") for m in errors)
+
+
+class TestRefresh:
+    def test_refresh_saves_and_replaces(self, cache_file, nse_calls):
+        _save(cache_file, LIST_2026)
+        assert load_holidays() == LIST_2026
+        nse_calls["answer"] = _answer("26-Jan-2026", "03-Mar-2026")
+        assert imc.refresh_holidays() is True
+        expected = [dt.date(2026, 1, 26), dt.date(2026, 3, 3)]
+        assert load_holidays() == expected
+        assert _saved(cache_file) == expected
+
+    @pytest.mark.parametrize(
+        "answer",
+        [RuntimeError("NSE down"), {}, {"CM": []}, {"CM": [{"other": 1}]}, "garbled"],
+        ids=["raises", "no-CM", "empty-CM", "no-tradingDate", "garbled"],
+    )
+    def test_failed_refresh_keeps_the_list(self, cache_file, nse_calls, caplog, answer):
+        caplog.set_level(logging.WARNING, logger="indian_market_calendar")
+        _save(cache_file, LIST_2026)
+        before = cache_file.read_bytes()
+        nse_calls["answer"] = answer
+        assert imc.refresh_holidays() is False
+        assert load_holidays() == LIST_2026
+        assert cache_file.read_bytes() == before
+        assert any(r.getMessage().startswith("NSE holiday API failed") for r in caplog.records)
+
+    def test_question_during_slow_refresh_answers_from_the_file(self, monkeypatch, cache_file):
+        """Row 10: a question while NSE takes 1 s is answered at once from the saved file."""
+        _save(cache_file, LIST_2026)
+        inside = threading.Event()
+
+        def slow_holiday_master():
+            inside.set()
+            time.sleep(1.0)
+            return _answer("26-Jan-2026")
+
+        monkeypatch.setattr(nsepython, "holiday_master", slow_holiday_master)
+        refresher = threading.Thread(target=imc.refresh_holidays)
+        refresher.start()
+        try:
+            assert inside.wait(5)
+            started = time.monotonic()
+            assert load_holidays() == LIST_2026
+            assert time.monotonic() - started < 0.1
+        finally:
+            refresher.join(5)
+
+    def test_question_during_hung_refresh_with_no_file_counts_weekdays_open(self, monkeypatch):
+        """Row 11: no file, NSE hung → answered at once, weekdays open."""
+        inside, release = threading.Event(), threading.Event()
+
+        def hung_holiday_master():
+            inside.set()
+            release.wait(5)
+            raise RuntimeError("NSE hung")
+
+        monkeypatch.setattr(nsepython, "holiday_master", hung_holiday_master)
+        refresher = threading.Thread(target=imc.refresh_holidays)
+        refresher.start()
+        try:
+            assert inside.wait(5)
+            started = time.monotonic()
+            assert imc.is_trading_day(dt.date(2026, 10, 20)) is True
+            assert time.monotonic() - started < 0.1
+        finally:
+            release.set()
+            refresher.join(5)
+
+    def test_answer_missing_a_kept_year_keeps_that_year(self, monkeypatch, cache_file, nse_calls):
+        """Row 21: a 2027-only answer keeps the kept 2026 dates."""
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 12, 20))
+        _save(cache_file, LIST_2026)
+        nse_calls["answer"] = _answer("26-Jan-2027")
+        assert imc.refresh_holidays() is True
+        assert imc.is_trading_day(dt.date(2026, 12, 25)) is False
+        assert imc.is_trading_day(dt.date(2027, 1, 26)) is False
+        assert _saved(cache_file) == LIST_2026 + [dt.date(2027, 1, 26)]
+
+    def test_answer_replaces_its_own_year(self, cache_file, nse_calls):
+        """Row 21: the answer's year replaces that year's kept dates."""
+        _save(cache_file, [dt.date(2027, 1, 26)])
+        nse_calls["answer"] = _answer("15-Jan-2027")
+        assert imc.refresh_holidays() is True
+        assert imc.is_trading_day(dt.date(2027, 1, 26)) is True
+        assert imc.is_trading_day(dt.date(2027, 1, 15)) is False
+
+
+class TestConfigure:
+    def test_reconfigure_forgets_the_remembered_list(self, tmp_path, cache_file):
+        _save(cache_file, LIST_2026)
+        assert load_holidays() == LIST_2026
+        imc.configure(cache_path=tmp_path / "missing" / "nse_holidays.pkl")
+        assert load_holidays() == []
+
+    def test_holiday_cache_path_is_the_configured_path(self, tmp_path):
+        imc.configure(cache_path=tmp_path / "elsewhere.pkl")
+        assert imc.holiday_cache_path() == tmp_path / "elsewhere.pkl"
+
+    def test_holiday_cache_path_raises_when_unset(self, monkeypatch):
+        monkeypatch.setattr(imc, "_cache_path", None, raising=False)
+        with pytest.raises(RuntimeError, match="not configured"):
+            imc.holiday_cache_path()
 
 
 class TestConfigureGuard:
