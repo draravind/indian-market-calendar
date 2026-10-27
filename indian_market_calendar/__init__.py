@@ -7,6 +7,7 @@ optional logger) once at startup via ``configure()``.
 Public API (see ``__all__``):
   Time      — IST, MARKET_OPEN, MARKET_CLOSE, now, today, is_after_market_close
   Holidays  — load_holidays (saved list only, never the network),
+              reload_holidays (re-read a file another process saved),
               refresh_holidays (NSE fetch, merged by year, saved atomically),
               holiday_cache_path
   Calendar  — is_trading_day, compute_last_trading_day, next_trading_day
@@ -38,6 +39,7 @@ __all__ = [
     "today",
     "is_after_market_close",
     "load_holidays",
+    "reload_holidays",
     "refresh_holidays",
     "holiday_cache_path",
     "is_trading_day",
@@ -173,6 +175,15 @@ def load_holidays() -> list[date]:
             _load_failed_on = anchor
             return []
         return _cached_holidays
+
+
+def reload_holidays() -> None:
+    """Re-read the saved holiday file and use it; on a failure the remembered list stays and the error is raised."""
+    global _cached_holidays, _load_failed_on
+    holidays = _read_cache_file(holiday_cache_path())
+    with _cache_lock:
+        _cached_holidays = holidays
+        _load_failed_on = None
 
 
 def refresh_holidays() -> bool:

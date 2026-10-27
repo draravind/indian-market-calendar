@@ -160,6 +160,44 @@ class TestRefresh:
         assert imc.is_trading_day(dt.date(2027, 1, 15)) is False
 
 
+class TestReload:
+    """A reader picking up a file another process saved."""
+
+    def test_reload_replaces_the_remembered_list(self, cache_file):
+        _save(cache_file, LIST_2026)
+        assert load_holidays() == LIST_2026
+        _save(cache_file, [dt.date(2027, 1, 26)])
+        imc.reload_holidays()
+        assert load_holidays() == [dt.date(2027, 1, 26)]
+
+    def test_broken_file_raises_and_keeps_the_old_list(self, cache_file):
+        _save(cache_file, LIST_2026)
+        assert load_holidays() == LIST_2026
+        cache_file.write_bytes(b"not a pickle")
+        with pytest.raises(pickle.UnpicklingError):
+            imc.reload_holidays()
+        assert load_holidays() == LIST_2026
+
+    def test_missing_file_with_nothing_remembered_raises_and_answers_empty(self):
+        with pytest.raises(FileNotFoundError):
+            imc.reload_holidays()
+        assert load_holidays() == []
+
+    def test_junk_file_with_nothing_remembered_counts_weekdays_open(self, cache_file):
+        cache_file.write_bytes(b"\x00\x01junk")
+        with pytest.raises(pickle.UnpicklingError):
+            imc.reload_holidays()
+        assert load_holidays() == []
+        assert imc.is_trading_day(dt.date(2026, 10, 20)) is True
+
+    def test_reload_ends_todays_failed_load(self, monkeypatch, cache_file):
+        monkeypatch.setattr(imc, "today", lambda: dt.date(2026, 10, 19))
+        assert load_holidays() == []
+        _save(cache_file, LIST_2026)
+        imc.reload_holidays()
+        assert load_holidays() == LIST_2026
+
+
 class TestConfigure:
     def test_reconfigure_forgets_the_remembered_list(self, tmp_path, cache_file):
         _save(cache_file, LIST_2026)

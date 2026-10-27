@@ -12,6 +12,7 @@ import indian_market_calendar as imc
 
 imc.configure(cache_path=Path("/var/cache/nse_holidays.pkl"), logger=logging.getLogger("app"))
 imc.refresh_holidays()         # fetch from NSE and save; call at start-up and daily, off the event loop
+                               # (several processes sharing one file: one downloads, the others reload_holidays())
 
 imc.now()                      # tz-aware IST datetime
 imc.today()                    # IST date
@@ -30,6 +31,7 @@ imc.next_session_window_open()
 - **Holidays:**
   - `load_holidays()` — the saved list only, never the network: the cache file is read once and kept in memory; with no readable file it returns `[]` (every weekday a trading day) and logs one error per IST date.
   - `refresh_holidays() -> bool` — fetches NSE's list with no lock held, merges it by year (the answer's years replace their own dates; other years' saved dates stay), saves it atomically and uses it. On a failed or empty answer the saved list stays and it returns `False`. Nothing calls it for you: the host calls it at start-up and on its own schedule.
+  - `reload_holidays()` — re-reads the cache file and uses it, for a process picking up a file another process saved (like `zoneinfo.ZoneInfo.clear_cache()`). On a failed read the remembered list stays and the error is raised.
   - `holiday_cache_path()` — the configured cache file.
 - **Calendar:** `is_trading_day(day)`, `compute_last_trading_day()`, `next_trading_day(day)`
 - **Market / scheduling:** `Market`, `is_market_open(now=None, *, market=NSE)`, `next_fire_at(target_time, now=None)`, `is_in_session_window(now=None)`, `next_session_window_open(now=None)`, `SESSION_WINDOW_PRE_OPEN_BUFFER`, `SESSION_WINDOW_POST_CLOSE_BUFFER`
