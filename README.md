@@ -30,7 +30,7 @@ imc.next_session_window_open()
 - **Time:** `IST`, `MARKET_OPEN`, `MARKET_CLOSE`, `now()`, `today()`, `is_after_market_close()`
 - **Holidays:**
   - `load_holidays()` — the saved list only, never the network: the cache file is read once and kept in memory; with no readable file it returns `[]` (every weekday a trading day) and logs one error per IST date.
-  - `refresh_holidays() -> bool` — fetches NSE's list with no lock held, merges it by year (the answer's years replace their own dates; other years' saved dates stay), saves it atomically and uses it. On a failed or empty answer the saved list stays and it returns `False`. Nothing calls it for you: the host calls it at start-up and on its own schedule.
+  - `refresh_holidays() -> bool` — fetches NSE's list with no lock held, merges it by year (the answer's years replace their own dates; other years' saved dates stay), saves it atomically and uses it. On a failed or empty answer the saved list stays and it returns `False`. Each request to NSE gives up after 3.05 s waiting to connect or 27 s with no byte, and the whole download after 60 s however slowly NSE sends; either counts as a failed answer. Nothing calls it for you: the host calls it at start-up and on its own schedule.
   - `reload_holidays()` — re-reads the cache file and uses it, for a process picking up a file another process saved (like `zoneinfo.ZoneInfo.clear_cache()`). On a failed read the remembered list stays and the error is raised.
   - `holiday_cache_path()` — the configured cache file.
 - **Calendar:** `is_trading_day(day)`, `compute_last_trading_day()`, `next_trading_day(day)`

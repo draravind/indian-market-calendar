@@ -1,5 +1,4 @@
 """Shared fixtures for the indian_market_calendar test suite."""
-import nsepython
 import pytest
 
 import indian_market_calendar as imc
@@ -22,4 +21,4 @@ def _no_nse(monkeypatch):
     def unreachable():
         raise RuntimeError("NSE is not reachable from tests")
 
-    monkeypatch.setattr(nsepython, "holiday_master", unreachable)
+    monkeypatch.setattr(imc, "_fetch_nse_holidays", unreachable)

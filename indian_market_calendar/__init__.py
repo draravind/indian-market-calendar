@@ -28,8 +28,8 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import nsepython
 import pandas as pd
+import requests
 
 __all__ = [
     "IST",
@@ -134,6 +134,26 @@ _cache_lock = threading.Lock()
 _cached_holidays: list[date] | None = None
 _load_failed_on: date | None = None  # IST date of the last failed file read
 
+_NSE_HOME = "https://www.nseindia.com"
+_NSE_HOLIDAYS_URL = "https://www.nseindia.com/api/holiday-master?type=trading"
+_NSE_TIMEOUT = (3.05, 27)  # (connect, read) seconds, per request
+_NSE_TOTAL_LIMIT = 60  # seconds for the whole download, however slowly NSE sends
+_NSE_HEADERS = {  # browser headers, as nsepython sends them
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "accept-language": "en-US,en;q=0.9,en-IN;q=0.8,en-GB;q=0.7",
+    "cache-control": "max-age=0",
+    "priority": "u=0, i",
+    "sec-ch-ua": '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+}
+
 
 def holiday_cache_path() -> Path:
     """The configured holiday-cache file."""
@@ -186,6 +206,40 @@ def reload_holidays() -> None:
         _load_failed_on = None
 
 
+def _fetch_nse_holidays() -> dict:
+    """NSE's trading-holiday answer; cookies from the home page first, each request time-limited."""
+    with requests.Session() as s:
+        s.headers.update(_NSE_HEADERS)
+        s.get(_NSE_HOME, timeout=_NSE_TIMEOUT)
+        r = s.get(_NSE_HOLIDAYS_URL, timeout=_NSE_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+
+def _fetch_nse_holidays_capped() -> dict:
+    """``_fetch_nse_holidays`` given up after ``_NSE_TOTAL_LIMIT`` s.
+
+    requests' timeouts only bound the gap between bytes, so the download runs in
+    a daemon thread; one still running at the cap is abandoned, not waited for.
+    """
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["answer"] = _fetch_nse_holidays()
+        except BaseException as e:
+            outcome["error"] = e
+
+    worker = threading.Thread(target=run, name="nse-holiday-fetch", daemon=True)
+    worker.start()
+    worker.join(_NSE_TOTAL_LIMIT)
+    if worker.is_alive():
+        raise requests.Timeout(f"NSE holiday download took over {_NSE_TOTAL_LIMIT} s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["answer"]
+
+
 def refresh_holidays() -> bool:
     """Fetch NSE's holiday list, merge it by year, save it and use it.
 
@@ -196,7 +250,7 @@ def refresh_holidays() -> bool:
     global _cached_holidays
     path = holiday_cache_path()
     try:
-        answer = nsepython.holiday_master()
+        answer = _fetch_nse_holidays_capped()
         fetched = pd.to_datetime(pd.DataFrame(answer["CM"])["tradingDate"]).dt.date.tolist()
         if not fetched:
             raise ValueError("empty holiday list")

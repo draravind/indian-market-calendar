@@ -5,9 +5,9 @@ import pickle
 import threading
 import time
 
-import nsepython
 import pandas as pd
 import pytest
+import requests
 
 import indian_market_calendar as imc
 from indian_market_calendar import load_holidays
@@ -25,7 +25,7 @@ def _saved(path):
 
 
 def _answer(*trading_dates):
-    """NSE's ``holiday_master()`` answer for these ``%d-%b-%Y`` dates."""
+    """NSE's holiday-master answer for these ``%d-%b-%Y`` dates."""
     return {"CM": [{"tradingDate": d} for d in trading_dates]}
 
 
@@ -39,13 +39,13 @@ def nse_calls(monkeypatch):
     """Record every NSE call; tests set ``answer`` (a dict, or an exception to raise)."""
     record = {"calls": 0, "answer": RuntimeError("NSE unreachable")}
 
-    def fake_holiday_master():
+    def fake_fetch():
         record["calls"] += 1
         if isinstance(record["answer"], BaseException):
             raise record["answer"]
         return record["answer"]
 
-    monkeypatch.setattr(nsepython, "holiday_master", fake_holiday_master)
+    monkeypatch.setattr(imc, "_fetch_nse_holidays", fake_fetch)
     return record
 
 
@@ -104,12 +104,12 @@ class TestRefresh:
         _save(cache_file, LIST_2026)
         inside = threading.Event()
 
-        def slow_holiday_master():
+        def slow_fetch():
             inside.set()
             time.sleep(1.0)
             return _answer("26-Jan-2026")
 
-        monkeypatch.setattr(nsepython, "holiday_master", slow_holiday_master)
+        monkeypatch.setattr(imc, "_fetch_nse_holidays", slow_fetch)
         refresher = threading.Thread(target=imc.refresh_holidays)
         refresher.start()
         try:
@@ -124,12 +124,12 @@ class TestRefresh:
         """Row 11: no file, NSE hung → answered at once, weekdays open."""
         inside, release = threading.Event(), threading.Event()
 
-        def hung_holiday_master():
+        def hung_fetch():
             inside.set()
             release.wait(5)
             raise RuntimeError("NSE hung")
 
-        monkeypatch.setattr(nsepython, "holiday_master", hung_holiday_master)
+        monkeypatch.setattr(imc, "_fetch_nse_holidays", hung_fetch)
         refresher = threading.Thread(target=imc.refresh_holidays)
         refresher.start()
         try:
@@ -158,6 +158,97 @@ class TestRefresh:
         assert imc.refresh_holidays() is True
         assert imc.is_trading_day(dt.date(2027, 1, 26)) is True
         assert imc.is_trading_day(dt.date(2027, 1, 15)) is False
+
+
+class _FakeResponse:
+    def __init__(self, answer):
+        self._answer = answer
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._answer
+
+
+class _FakeSession:
+    """``requests.Session`` stand-in: records each ``get``; ``fail_api`` makes the API request raise."""
+
+    gets: list = []
+    answer: dict = {}
+    fail_api: BaseException | None = None
+
+    def __init__(self):
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, timeout=None):
+        type(self).gets.append((url, timeout))
+        fail = type(self).fail_api
+        if "/api/" in url and fail is not None:
+            raise fail
+        return _FakeResponse(type(self).answer)
+
+
+class TestFetch:
+    """The NSE download itself: every request is time-limited."""
+
+    @pytest.fixture(autouse=True)
+    def _no_nse(self, monkeypatch):
+        """Overrides the suite's guard: the real download runs against a fake session."""
+        monkeypatch.setattr(_FakeSession, "gets", [])
+        monkeypatch.setattr(_FakeSession, "answer", _answer("26-Jan-2026"))
+        monkeypatch.setattr(_FakeSession, "fail_api", None)
+        monkeypatch.setattr(imc.requests, "Session", _FakeSession)
+
+    def test_every_request_carries_the_time_limit(self):
+        assert imc._fetch_nse_holidays() == _answer("26-Jan-2026")
+        assert _FakeSession.gets == [
+            ("https://www.nseindia.com", (3.05, 27)),
+            ("https://www.nseindia.com/api/holiday-master?type=trading", (3.05, 27)),
+        ]
+
+    def test_whole_download_is_capped_at_sixty_seconds(self):
+        assert imc._NSE_TOTAL_LIMIT == 60
+
+    def test_trickling_download_is_cut_off_and_keeps_the_list(self, monkeypatch, cache_file):
+        """NSE sends a byte now and then, never finishing: the refresh gives up at the cap."""
+        _save(cache_file, LIST_2026)
+        before = cache_file.read_bytes()
+        release = threading.Event()
+
+        def trickling_fetch():
+            release.wait(5)
+            return _answer("26-Jan-2026")
+
+        monkeypatch.setattr(imc, "_fetch_nse_holidays", trickling_fetch)
+        monkeypatch.setattr(imc, "_NSE_TOTAL_LIMIT", 0.2)
+        try:
+            started = time.monotonic()
+            assert imc.refresh_holidays() is False
+            assert time.monotonic() - started < 2
+        finally:
+            release.set()
+        assert load_holidays() == LIST_2026
+        assert cache_file.read_bytes() == before
+
+    def test_download_inside_the_cap_is_used(self, monkeypatch, cache_file):
+        monkeypatch.setattr(imc, "_NSE_TOTAL_LIMIT", 5)
+        assert imc.refresh_holidays() is True
+        assert _saved(cache_file) == [dt.date(2026, 1, 26)]
+
+    def test_timeout_fails_the_refresh_and_keeps_the_list(self, cache_file):
+        _save(cache_file, LIST_2026)
+        before = cache_file.read_bytes()
+        _FakeSession.fail_api = requests.Timeout("read timed out")
+        assert imc.refresh_holidays() is False
+        assert load_holidays() == LIST_2026
+        assert cache_file.read_bytes() == before
 
 
 class TestReload:
